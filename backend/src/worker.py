@@ -1,22 +1,39 @@
-import json,time,traceback
-from pathlib import Path
-from .config.database import Base,engine,SessionLocal
-from .models import CompositionRun
-from .constants.status import RunStatus
-from .services.run_service import queue
-from .services.analysis_service import analyze_composition
-from .services.audit_service import log
-Base.metadata.create_all(engine);Path("/artifacts").mkdir(exist_ok=True)
-while True:
-    Path("/artifacts/heartbeat").write_text(str(time.time()))
-    job=queue.blpop("composition:jobs",timeout=2)
-    if not job:continue
-    with SessionLocal() as db:
-        run=db.get(CompositionRun,int(job[1]))
-        if not run or run.status!=RunStatus.QUEUED:continue
-        run.status=RunStatus.RUNNING;db.commit()
+import logging, os, socket, time, uuid
+from .config.database import Base, engine
+from .config.settings import WORKER_SWEEP_SECONDS
+from .services import queue_service
+from .services.recovery_service import ensure_schema, sweep
+from .services.runner_service import heartbeat, process
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+def owner_name():
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+def main():
+    Base.metadata.create_all(engine)
+    ensure_schema()
+    owner = owner_name()
+    logging.info("composition worker %s started", owner)
+    heartbeat()
+    last_sweep = 0.0
+    while True:
+        heartbeat()
+        if time.monotonic() - last_sweep >= WORKER_SWEEP_SECONDS:
+            try:
+                sweep(owner)
+            except Exception:
+                logging.warning("recovery sweep failed", exc_info=True)
+            last_sweep = time.monotonic()
         try:
-            run.result=analyze_composition(run.input_snapshot,run.delta,run.permutations,run.seed);run.status=RunStatus.COMPLETED
-            Path(f"/artifacts/run-{run.id}.json").write_text(json.dumps(run.result,ensure_ascii=False));log(db,"worker","composition.completed",run.id)
-        except Exception as e:run.status=RunStatus.FAILED;run.error=str(e);traceback.print_exc()
-        db.commit()
+            run_id = queue_service.take_run(timeout=2)
+        except Exception:
+            logging.warning("composition queue unavailable; retrying", exc_info=True)
+            time.sleep(1)
+            continue
+        if run_id is None:
+            continue
+        process(run_id, owner)
+
+if __name__ == "__main__":
+    main()

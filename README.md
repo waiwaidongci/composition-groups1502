@@ -21,6 +21,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 | analyst 组成研究员 | analyst@lisui.demo | Lisui2026! | 六页；来源核对、配置δ/B、提交运行和补样说明 |
 | viewer 补样阅读者 | viewer@lisui.demo | Lisui2026! | 六页只读；下载获批完成研究CSV |
 
+受理即持久：`POST /runs` 先提交数据库行再入队。队列暂不可用时任务仍保留为 `queued`，后端内嵌恢复执行器和worker的定期扫描会把缺失的队列项补回。
+
 JWT角色在后端执行，viewer写入403、analyst审批403、未获批导出403、重复审批409。登录/批注/排队/worker完成/建议与审批留审计。登录IP每分钟最多30次，另有统一错误中间件。请求校验422只返回loc/msg文本，不回显含NaN/Inf的input。部署时修改JWT_SECRET及Compose内MySQL口令。
 
 ## 一天的研究剧本
@@ -71,7 +73,21 @@ B199–999次均匀置换标签，组规模保持，固定seed与自然键排序
 
 全局组差也可受组内离散度影响，只给到组CLR质心的平均/最大距离描述，未正式检验离散度同质；独立与零假设下标签可交换是前提。不是工艺因果、性能概率、逐组对照p或事后选择保证。p最小分辨率1/(B+1)，有Monte Carlo波动。
 
-当前算法/指纹版本为 `closure-replacement-clr-permanova-v2`。v1在真实6点夹具的数学并列漏计曾被独立复核发现；v2修复、空卷重跑及原证据详见TESTING，不用历史v1运行冒充最终结果。
+当前算法/指纹版本为 `closure-replacement-clr-permanova-v2`；恢复不改变版本或指纹。v1在真实6点夹具的数学并列漏计曾被独立复核发现；v2修复、空卷重跑及原证据详见TESTING，不用历史v1运行冒充最终结果。
+
+## 中断与自动恢复
+
+任务在被受理后可能遇到三类中断，系统按“数据库是受理凭据、结果文件是完成凭据、租约是所有权凭据”处理：
+
+1. **队列断连**：已受理行仍是 `queued`，恢复扫描发现Redis列表缺失该id时自动重新入队；重复入队无副作用。页面恢复状态 `queue_pending`，原因写入 `recovery_reason`。
+2. **计算进程失联**：接手通过带条件的原子更新取得租约，`attempts` 与 `lease_token` 同时匹配才成功，多进程并发只有一个赢家。计算期间后台线程续租；若续租失败（已被接手），旧进程丢弃自己的结果，绝不回传覆盖。
+3. **结果写出后、完成状态保存前中断**：结果先以临时文件+`fsync`+原子改名发布到 `/artifacts/run-<id>-attempt-<n>.json`，再置 `saving`，最后置 `completed`。恢复扫描或下一任接手会核对文件中的运行id、attempt、算法版本、冻结输入指纹、结果指纹与配置（δ/B/seed），匹配才采纳原文件，不重算、不换种子。
+
+租约默认30秒（`WORKER_LEASE_SECONDS`），计算期间后台每10秒续租，心跳5秒，扫描2秒；连续接手达到 `WORKER_MAX_ATTEMPTS`（默认8）时置 `failed` 并把原因写进 `error`，页面显示失败原因。恢复沿用受理时冻结的 `input_snapshot`、δ、置换次数与seed；同seed在恢复下必然得到同一结果。
+
+`refresh` 后 `GET /runs` 返回 `recovery_state`（`normal/queue_pending/recovering/saving/recovered/failed`）、`attempts`、`recovery_count`、`recovery_reason`、`result_hash`、`artifact_key`、`finished_at`。租约token不返回给客户端。审批时把当前完成结果的 `approved_result_hash` 固定到运行行，导出独立重验结果文件与该指纹，二者不一致返回409；旧档案（升级前无结果文件/指纹）直接用数据库结果，保持可读可导出。
+
+可并发执行：`docker compose up -d --scale worker=3`（worker不再固定container_name，心跳按实例共享，健康检查只要有一个实例在跑即通过）。兜底由 `INLINE_RUNNER_ENABLED`（默认true）控制后端内嵌执行器，它只在worker心跳超过15秒未更新时工作，并与worker走同一套 claim/lease/发布协议；队列不可用时 `/health` 返回 `degraded` 而非拖垮API。
 
 ## 工程与开发
 
@@ -92,8 +108,8 @@ npm ci
 npm run dev
 ```
 
-`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}` 按来源、变换、PERMANOVA、运行、审阅和横切拆分；`backend/scripts/seed_demo.py`；migration为可选索引，metadata首次建表，非独立全量DDL。`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}` 为Vue应用。
+`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}` 按来源、变换、PERMANOVA、运行、审阅和横切拆分；恢复逻辑集中在`services/recovery_service.py`，单次执行协议在`services/runner_service.py`，后端内嵌执行器在`services/inline_runner.py`；`backend/scripts/seed_demo.py`；migration为可选索引，metadata首次建表，恢复列由`ensure_schema()`就地补齐，非独立全量DDL。`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}` 为Vue应用。
 
 RunSummary跨首页/结果/审阅，GroupProfiles跨首页/结果，CompositionMatrix跨来源/结果，另有StudySelector、PermutationPlot及通用DataTable/Notice/StatusBadge。两hooks useResearch/useAction及utils处理公共状态。角色枚举backend/constants/roles与frontend/constants/enums参与鉴权/角色显示，队列状态backend/constants/status与前端RunStatus参与worker/StatusBadge，审阅Literal在backend/schemas/note和model/service/前端ReviewStatus。
 
-.env含COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET、SEED_DEMO，DATABASE_URL/REDIS_URL由Compose定义。源码不含测试截图/日志；关键JSON/CSV、截图与已知差异在同批test-artifacts/gb-0029。当前为单worker研究系统，无来源上传、多worker去重、崩溃恢复或真实设备操作。清理仅本题：`docker compose down -v --remove-orphans`。MIT License。
+.env含COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET、SEED_DEMO，DATABASE_URL/REDIS_URL由Compose定义；恢复相关`WORKER_LEASE_SECONDS`、`WORKER_SWEEP_SECONDS`、`WORKER_MAX_ATTEMPTS`、`INLINE_RUNNER_ENABLED`、`ARTIFACT_DIR`有默认值。源码不含测试截图/日志；关键JSON/CSV、截图与已知差异在同批test-artifacts/gb-0029。多worker并发与崩溃/断连恢复已支持；无来源上传、无真实设备操作。清理仅本题：`docker compose down -v --remove-orphans`。MIT License。

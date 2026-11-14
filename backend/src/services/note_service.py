@@ -2,6 +2,7 @@ from fastapi import HTTPException
 from ..models import CompositionRun,ResampleNote
 from ..utils.serialize import record
 from .audit_service import log
+from .recovery_service import pin_approval
 
 def list_notes(db):return [record(n) for n in db.query(ResampleNote).order_by(ResampleNote.id.desc())]
 def create_note(db,data,user):
@@ -13,5 +14,12 @@ def review_note(db,nid,data,user):
     row=db.get(ResampleNote,nid)
     if not row:raise HTTPException(404,"补样建议不存在")
     if row.status!="submitted":raise HTTPException(409,"已审阅建议不可重复审批")
+    if data.status=="approved":
+        run=db.get(CompositionRun,row.run_id)
+        if not run or run.status!="completed":
+            raise HTTPException(409,"研究尚未完成，暂不能批准归档")
+        # Approval binds to the exact completed result that export will read.
+        if not pin_approval(db,run):
+            raise HTTPException(409,"完成结果不可用，暂不能批准归档")
     row.status=data.status;row.reviewer=user.name;row.review_note=data.review_note
     log(db,user.email,"resample."+data.status,row.id);db.commit();return record(row)
